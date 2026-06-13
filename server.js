@@ -98,11 +98,11 @@ async function initDB() {
 const app    = express();
 const server = http.createServer(app);
 const io     = new Server(server, {
-  cors: { origin: CLIENT_URL, methods: ['GET','POST'] },
-  maxHttpBufferSize: 10 * 1024 * 1024 // 10MB для файлов
+  cors: { origin: '*', methods: ['GET','POST'] },
+  maxHttpBufferSize: 10 * 1024 * 1024
 });
 
-app.use(cors({ origin: CLIENT_URL }));
+app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -183,8 +183,16 @@ app.post('/api/login', async (req, res) => {
     const ok   = await bcrypt.compare(password, user.pass_hash);
     if (!ok) return res.status(400).json({ error: 'Неверный пароль' });
 
+    // Обновить статус на "online"
+    await db.query('UPDATE users SET online_status=$1 WHERE id=$2', ['online', user.id]);
+
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
     const { pass_hash, ...safeUser } = user;
+    safeUser.online_status = 'online';
+
+    // Оповестить всех что пользователь онлайн
+    io.emit('user:online', { user_id: user.id });
+
     res.json({ token, user: { ...safeUser, tag: '@'+user.username } });
   } catch (e) {
     console.error(e);
@@ -215,13 +223,34 @@ app.put('/api/me', authMiddleware, async (req, res) => {
 
 // Поиск пользователей
 app.get('/api/users/search', authMiddleware, async (req, res) => {
-  const q = '%' + (req.query.q||'') + '%';
-  const r = await db.query(
-    `SELECT id,username,name,avatar_img,avatar_emoji,online_status,today_status FROM users
-     WHERE (username ILIKE $1 OR name ILIKE $1) AND id != $2 LIMIT 20`,
-    [q, req.user.id]
-  );
-  res.json(r.rows);
+  try {
+    const q = (req.query.q || '').trim();
+    let r;
+    if (!q) {
+      // Без запроса — вернуть всех пользователей кроме себя
+      r = await db.query(
+        `SELECT id, username, name, avatar_img, avatar_emoji, online_status, today_status
+         FROM users WHERE id != $1
+         ORDER BY online_status='online' DESC, name ASC
+         LIMIT 100`,
+        [req.user.id]
+      );
+    } else {
+      const pattern = '%' + q + '%';
+      r = await db.query(
+        `SELECT id, username, name, avatar_img, avatar_emoji, online_status, today_status
+         FROM users
+         WHERE (username ILIKE $1 OR name ILIKE $1) AND id != $2
+         ORDER BY online_status='online' DESC, name ASC
+         LIMIT 20`,
+        [pattern, req.user.id]
+      );
+    }
+    res.json(r.rows);
+  } catch(e) {
+    console.error('Search error:', e);
+    res.status(500).json({ error: 'Ошибка поиска' });
+  }
 });
 
 // ─────────────────────────────────────────
@@ -447,9 +476,11 @@ io.on('connection', async (socket) => {
   socket.on('call:signal',  ({ target_user_id, signal }) => { const s=onlineUsers.get(target_user_id); if(s) io.to(s).emit('call:signal',  { from_user_id: userId, signal }); });
 
   // ── ОТКЛЮЧЕНИЕ ──
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     onlineUsers.delete(userId);
     socket.broadcast.emit('user:offline', { user_id: userId });
+    // Обновить статус в БД
+    try { await db.query('UPDATE users SET online_status=$1 WHERE id=$2', ['offline', userId]); } catch(e) {}
     console.log(`🔴 User ${socket.user.username} disconnected`);
   });
 });
