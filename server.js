@@ -155,6 +155,15 @@ app.post('/api/register', async (req, res) => {
     );
     const user = result.rows[0];
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+
+    // Оповестить всех онлайн — появился новый пользователь
+    io.emit('user:new', {
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      online_status: 'online',
+    });
+
     res.json({ token, user: { ...user, tag: '@'+user.username } });
   } catch (e) {
     console.error(e);
